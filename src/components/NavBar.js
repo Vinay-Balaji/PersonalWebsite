@@ -46,8 +46,11 @@ export default function Nav({ color }) {
     aboutSection.scrollIntoView({ behavior: "smooth" });
   };
   const scrollToExperience = () => {
-    const experienceSection = document.querySelector("#experience");
-    experienceSection.scrollIntoView({ behavior: "smooth" });
+    // const experienceSection = document.querySelector("#experience");
+    // experienceSection.scrollIntoView({ behavior: "smooth" });
+    var url = 'https://drive.google.com/file/d/17x2rJhQKSQIwGQtnba3CgdwPzh4tyIp0/view';
+        var win = window.open(url, '_blank');
+        win.focus();
   };
   const scrollToProjects = () => {
     const projectsSection = document.querySelector("#projects");
@@ -102,7 +105,7 @@ export default function Nav({ color }) {
                   About
                 </Button>
                 <Button variant="ghost" onClick={scrollToExperience}>
-                  Experience
+                  Resume
                 </Button>
                 <Button variant="ghost" onClick={scrollToProjects}>
                   Projects

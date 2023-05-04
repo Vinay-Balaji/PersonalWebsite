@@ -1,5 +1,5 @@
 ## Citizens Bank (July 2023 - December 2023)
-I'm excited to announce that I'll be joining Citizens Bank as a member of their team specializing in Robotic Process Automation (RPA) and UPath. In this role, I'll be responsible for leveraging my skills and expertise to automate repetitive tasks, optimize workflows, and drive process efficiencies. I'm thrilled to be a part of such a dynamic team and look forward to contributing to the continued success of Citizens Bank.
+I'm excited to announce that I'll be joining Citizens Bank as a member of their team specializing in Robotic Process Automation (RPA) and UIPath. In this role, I'll be responsible for leveraging my skills and expertise to automate repetitive tasks, optimize workflows, and drive process efficiencies. I'm thrilled to be a part of such a dynamic team and look forward to contributing to the continued success of Citizens Bank.
 - ![600x200](https://1000logos.net/wp-content/uploads/2022/09/Citizens-Bank-logo.png)
 - Tags: Citizens Bank
 - Badges:

@@ -48,7 +48,7 @@ export default function Nav({ color }) {
   const scrollToExperience = () => {
     // const experienceSection = document.querySelector("#experience");
     // experienceSection.scrollIntoView({ behavior: "smooth" });
-    var url = 'https://drive.google.com/file/d/17x2rJhQKSQIwGQtnba3CgdwPzh4tyIp0/view';
+    var url = 'https://drive.google.com/file/d/1a87zXswSl9gClgxm9aTk1e28wcSsGlG4/view?usp=sharing';
         var win = window.open(url, '_blank');
         win.focus();
   };

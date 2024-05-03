@@ -6,6 +6,14 @@ In my Computing Fundamentals class, I worked on an interactive two-player chess 
 - Buttons:
   - Link [https://docs.google.com/document/d/17Pi6KOxQ2y3OzsqHcFn31wmhDsP5gf_vi-FCGVzSSnU/edit]
 
+## AI Battleship Java Application
+Welcome to the AI Battleship Project! This project represents a modern take on the classic game of Battleship, with the twist of implementing Artificial Intelligence (AI) for the opponent.The AI Battleship game is a turn-based, strategy game where the goal is to find and sink all of the opponent's ships before they sink yours. This project enhances the game experience by using a hit and destroy algorithm to find opponent ships and attack them.
+- Tags: FloodIt Java Application
+- Badges:
+  - Java [blue]
+- Buttons:
+  - Link [https://github.com/Vinay-Balaji/AIBattleShip]
+
 ## SoccerBots
 In my engineering class, we designed two remote-controlled RC cars with Arduino, named Lightning and Sally, to mimic Rocket League for kids at the Boston Children’s Museum. The cars had custom-built chassis, were laser-cut with acrylic, and wirelessly controlled with joysticks. They featured a distance sensor that detected when the soccer ball entered the goal, triggering an LED light-based scoring system. We used nRF24L01 wireless transceiver technology to transmit joystick coordinates to the car and custom-built the joystick with an Arduino.
 - Tags: SoccerBots
@@ -31,6 +39,23 @@ I built a Java application that utilizes Kruskal's algorithm to generate random 
 - Buttons:
   - Link [https://github.com/Vinay-Balaji/MazeGenerator]
 
+## Java Journal Application
+Welcome to the Java Journal! We are a powerful task management application designed to help you stay organized and productive throughout your busy week. With an intuitive user interface and robust features, it's the perfect tool for managing your tasks and events effectively.
+- Tags: Java Journal Application
+- Badges:
+  - Java [blue]
+- Buttons:
+  - Link [https://github.com/Vinay-Balaji/JavaJournal]
+
+## C.A.M.S Mount
+I worked on the Custom Airpod Magnetic Stem (C.A.M.S Mount) project, creating an accessory that improves accessibility for those with unique ear shapes or surgeries. Utilizing a dual-magnet system, the CAMS Mount secures AirPods discreetly and effectively, crafted through precise 3D printing. This innovation makes high-quality audio accessible, enhancing technology inclusivity without costly modifications.
+- Tags: C.A.M.S Mount
+- Badges:
+  - SolidWorks [green]
+  - 3D Printing [green]
+- Buttons:
+  - Link [https://drive.google.com/file/d/1pigHUfVBsHCMPdIzA4cu5Pv7kYijaq2A/view?usp=sharing]
+
 ## Braille UNO Cards
 I worked on a project to make UNO cards more accessible for individuals who are blind or have vision impairments. We used laser cutting to etch Braille numbers on each card, and created an interactive box for easy locating. The project was a success, and I was thrilled to make a meaningful difference in people's lives.
 - Tags: Braille UNO Cards
@@ -46,4 +71,3 @@ I created a smart tile that generates electricity from footsteps using piezoelec
   - Piezoelectricity [green]
 - Buttons:
   - Link [https://docs.google.com/presentation/d/1-IrL_d-bg9P2BABdiiWd_CQq03fxpOwptqVCPLcvHrU/edit#slide=id.g11401e3f94e_0_1276]
-  

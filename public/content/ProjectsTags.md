@@ -1,3 +1,0 @@
-Chess GUI
-SoccerBots
-FloodIt

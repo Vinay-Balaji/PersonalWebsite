@@ -7,9 +7,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
-from scipy import stats
 from datetime import datetime, date
 import os
 
@@ -17,25 +15,18 @@ st.set_page_config(page_title="Brent CTA Backtest", layout="wide", initial_sideb
 
 @st.cache_data
 def load_data():
-    # Read file
     if os.path.exists("bloomberg_data.xlsx"):
-        # Try with no header first (raw BDH format)
         df = pd.read_excel("bloomberg_data.xlsx", header=None)
     elif os.path.exists("bloomberg_data.csv"):
         df = pd.read_csv("bloomberg_data.csv")
     else:
         return None
 
-    # ── Detect raw BDH format ──
-    # BDH creates date-value pairs: A=dates, B=CO1, C=dates, D=CO12, E=dates, F=OVX, G=dates, H=VIX
-    # No headers, 8 columns, columns 0/2/4/6 are dates
+    # Detect raw BDH format: 8 columns, date-value pairs, no headers
     n_cols = len(df.columns)
-
     if n_cols >= 8:
-        # Check if first column looks like dates
         test_dates = pd.to_datetime(df.iloc[:, 0], errors="coerce")
         if test_dates.notna().sum() > len(df) * 0.5:
-            # Raw BDH format detected — reshape
             df = pd.DataFrame({
                 "Date": pd.to_datetime(df.iloc[:, 0], errors="coerce"),
                 "CO1":  pd.to_numeric(df.iloc[:, 1], errors="coerce"),
@@ -48,11 +39,8 @@ def load_data():
             df = df.dropna(subset=["CO1","CO12","OVX","VIX"]).reset_index(drop=True)
             return df
 
-    # ── Fallback: named columns (CSV or manually formatted xlsx) ──
-    # Fix column names — convert datetime objects to strings
+    # Fallback: named columns
     df.columns = [str(c).strip() if not isinstance(c, datetime) else "Date" for c in df.columns]
-
-    # Find date column
     date_col = None
     for col in df.columns:
         if str(col).strip().lower() == "date":
@@ -60,32 +48,25 @@ def load_data():
             break
     if date_col is None:
         date_col = df.columns[0]
-
     df = df.rename(columns={date_col: "Date"})
     df["Date"] = pd.to_datetime(df["Date"], format="mixed", errors="coerce")
     df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-
-    # Standardize column names
     col_map = {}
     for col in df.columns:
         cl = str(col).strip().upper()
-        if cl in ["CO1", "CO1 COMDTY", "BRENT", "CO1_CLOSE"]: col_map[col] = "CO1"
-        elif cl in ["CO12", "CO12 COMDTY", "CO12_CLOSE"]: col_map[col] = "CO12"
-        elif cl in ["OVX", "OVX INDEX", "OVX_CLOSE"]: col_map[col] = "OVX"
-        elif cl in ["VIX", "VIX INDEX", "VIX_CLOSE"]: col_map[col] = "VIX"
+        if cl in ["CO1","CO1 COMDTY","BRENT","CO1_CLOSE"]: col_map[col] = "CO1"
+        elif cl in ["CO12","CO12 COMDTY","CO12_CLOSE"]: col_map[col] = "CO12"
+        elif cl in ["OVX","OVX INDEX","OVX_CLOSE"]: col_map[col] = "OVX"
+        elif cl in ["VIX","VIX INDEX","VIX_CLOSE"]: col_map[col] = "VIX"
     df = df.rename(columns=col_map)
-
-    required = ["Date", "CO1", "CO12", "OVX", "VIX"]
+    required = ["Date","CO1","CO12","OVX","VIX"]
     for col in required:
         if col not in df.columns:
             st.error(f"Missing column: {col}. Expected: {required}")
-            st.info("If using raw Bloomberg BDH, make sure your file has 8 columns: "
-                    "4 date-value pairs for CO1, CO12, OVX, VIX in cells A1, C1, E1, G1.")
+            st.info("If using raw BDH, ensure 8 columns: 4 date-value pairs in A1, C1, E1, G1.")
             st.stop()
-
-    for col in ["CO1", "CO12", "OVX", "VIX"]:
+    for col in ["CO1","CO12","OVX","VIX"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df[["CO1","CO12","OVX","VIX"]] = df[["CO1","CO12","OVX","VIX"]].ffill().bfill()
     df = df.dropna(subset=["CO1","CO12","OVX","VIX"]).reset_index(drop=True)
     return df
@@ -109,7 +90,6 @@ def compute_signals(df_daily, tsmom_weight, carry_weight, lookbacks,
 
     month_ends["Carry_Spread"] = (month_ends["CO1"] - month_ends["CO12"]) / month_ends["CO1"]
     month_ends["Carry"] = np.sign(month_ends["Carry_Spread"])
-
     month_ends["OVX_VIX_Ratio"] = month_ends["OVX"] / month_ends["VIX"].replace(0, np.nan)
     month_ends["OVX_VIX_Ratio"] = month_ends["OVX_VIX_Ratio"].fillna(1.0)
 
@@ -124,7 +104,6 @@ def compute_signals(df_daily, tsmom_weight, carry_weight, lookbacks,
     month_ends["Composite"] = (raw * month_ends["Macro_Scale"]).clip(-1, 1)
     month_ends["TSMOM_Contribution"] = tsmom_weight * month_ends["TSMOM"]
     month_ends["Carry_Contribution"] = carry_weight * month_ends["Carry"]
-
     month_ends = month_ends.drop(columns=["YM"], errors="ignore").reset_index()
     month_ends = month_ends.rename(columns={"index": "Date"} if "index" in month_ends.columns else {})
     if "Date" not in month_ends.columns and month_ends.index.name == "Date":
@@ -156,7 +135,6 @@ def run_backtest(df_daily, df_signals, tc):
     monthly_positions = df.groupby("Month")["Position"].first()
     position_changed = monthly_positions.diff().abs() > 0.01
     tc_months = position_changed[position_changed].index
-
     df["TC"] = 0.0
     for m in tc_months:
         month_days = df[df["Month"] == m].index
@@ -176,7 +154,7 @@ def compute_stats(df_bt, return_col="Strat_Net", cum_col="Cumulative"):
     rets = df_bt[return_col].dropna()
     n_days = len(rets)
     if n_days == 0:
-        return {k: 0 for k in ["ann_ret", "ann_vol", "sharpe", "max_dd", "hit_rate"]}
+        return {k: 0 for k in ["ann_ret","ann_vol","sharpe","max_dd","hit_rate"]}
 
     final_cum = df_bt[cum_col].iloc[-1]
     ann_ret = final_cum ** (252 / n_days) - 1 if final_cum > 0 else -1
@@ -220,7 +198,6 @@ def main():
         df_filt = df_raw[(df_raw["Date"] >= pd.Timestamp(start_date)) & (df_raw["Date"] <= pd.Timestamp(end_date))]
         st.caption(f"{start_date} to {end_date} — {len(df_filt):,} days, {df_filt['Date'].dt.to_period('M').nunique()} months")
 
-        # Signal 1
         st.divider()
         st.subheader("Signal 1 — TSMOM")
         st.caption("Long if trending up, short if down.")
@@ -233,7 +210,6 @@ def main():
             st.error("Select at least one lookback.")
             st.stop()
 
-        # Signal 2
         st.divider()
         st.subheader("Signal 2 — Carry")
         st.caption("Long in backwardation, short in contango.")
@@ -245,7 +221,6 @@ def main():
         else:
             st.warning(f"Total weight: {total_w:.2f} (should be 1.0)")
 
-        # Signal 3
         st.divider()
         st.subheader("Signal 3 — OVX Macro Filter")
         st.caption("Scales exposure. Separates oil shocks from financial crises.")
@@ -277,7 +252,7 @@ def main():
 
     df_daily_bt = df_lb[(df_lb["Date"] >= pd.Timestamp(start_date)) & (df_lb["Date"] <= pd.Timestamp(end_date))].copy()
     df_bt = run_backtest(df_daily_bt, df_signals_bt, tc)
-    df_bt = df_bt.dropna(subset=["Strat_Net", "Cumulative"]).reset_index(drop=True)
+    df_bt = df_bt.dropna(subset=["Strat_Net","Cumulative"]).reset_index(drop=True)
     if len(df_bt) == 0:
         st.error("No backtest results.")
         st.stop()
@@ -294,6 +269,9 @@ def main():
         - **OVX Filter:** High OVX with normal VIX = oil-specific shock → stay full size. High VIX with normal OVX = financial crisis → scale down.
 
         **Composite = (TSMOM_w × TSMOM + Carry_w × Carry) × Macro Scale.** Monthly rebalance on prior month's signal.
+
+        **Note on Buy & Hold Sharpe:** The B&H benchmark uses raw CO1 front-month price returns, which include roll gaps when the generic contract switches months.
+        Bloomberg's reported Sharpe for CO1 typically uses a roll-adjusted total return index. Expect the raw B&H Sharpe here to be lower than Bloomberg's figure.
         """)
 
     # ── PERFORMANCE ──
@@ -329,7 +307,7 @@ def main():
                       margin=dict(l=60,r=30,t=30,b=40),
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                       xaxis=dict(rangeslider=dict(visible=True)))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # ── DRAWDOWN ──
     st.subheader("Drawdown")
@@ -338,7 +316,7 @@ def main():
                                 line=dict(color="#FF4B4B", width=1), fillcolor="rgba(255,75,75,0.3)"))
     fig_dd.update_layout(template="plotly_dark", yaxis_title="Drawdown", yaxis_tickformat=".0%",
                          height=350, margin=dict(l=60,r=30,t=30,b=40))
-    st.plotly_chart(fig_dd, use_container_width=True)
+    st.plotly_chart(fig_dd, width="stretch")
 
     # ── SIGNALS ──
     st.markdown("---")
@@ -353,7 +331,7 @@ def main():
         fig_s = go.Figure(go.Bar(x=df_sig_disp["Date"], y=df_sig_disp["Composite"], marker_color=colors))
         fig_s.update_layout(template="plotly_dark", yaxis_title="Signal [-1,+1]", height=400,
                             margin=dict(l=60,r=30,t=30,b=40))
-        st.plotly_chart(fig_s, use_container_width=True)
+        st.plotly_chart(fig_s, width="stretch")
 
     with cr:
         st.markdown("**Signal Contribution Breakdown**")
@@ -370,7 +348,7 @@ def main():
                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         fig_c.update_yaxes(title_text="Contribution", secondary_y=False)
         fig_c.update_yaxes(title_text="Macro Scale", range=[0,1.1], secondary_y=True)
-        st.plotly_chart(fig_c, use_container_width=True)
+        st.plotly_chart(fig_c, width="stretch")
 
     # ── DETAIL TABLE ──
     st.markdown("---")
@@ -400,72 +378,10 @@ def main():
         sdf = sdf.map(lambda x: "background-color: rgba(255,75,75,0.15)" if isinstance(x,(int,float)) and x<1.0 else "", subset=["Macro Scale"])
     except AttributeError:
         sdf = sdf.applymap(lambda x: "background-color: rgba(255,75,75,0.15)" if isinstance(x,(int,float)) and x<1.0 else "", subset=["Macro Scale"])
-    st.dataframe(sdf, use_container_width=True, height=400)
+    st.dataframe(sdf, width="stretch", height=400)
     st.download_button("Download Monthly Detail", dmd.to_csv(index=False), "monthly_detail.csv", "text/csv")
 
-    # ── HEATMAP ──
-    st.markdown("---")
-    st.subheader("Monthly Returns Heatmap")
-    hm = df_bt.copy()
-    hm["Year"] = pd.to_datetime(hm["Date"]).dt.year
-    hm["Month"] = pd.to_datetime(hm["Date"]).dt.month
-    mr = hm.groupby(["Year","Month"])["Strat_Net"].apply(lambda x: (1+x).prod()-1).reset_index()
-    mr.columns = ["Year","Month","Return"]
-    hd = mr.pivot(index="Year", columns="Month", values="Return").reindex(columns=range(1,13))
-    ml = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
-    try:
-        tv = hd.map(lambda x: f"{x:.1%}" if pd.notna(x) else "").values
-    except AttributeError:
-        tv = hd.applymap(lambda x: f"{x:.1%}" if pd.notna(x) else "").values
-    fig_hm = go.Figure(go.Heatmap(z=hd.values, x=ml, y=hd.index.astype(str), text=tv,
-                                  texttemplate="%{text}", textfont=dict(size=11),
-                                  colorscale="RdYlGn", zmid=0,
-                                  colorbar=dict(title="Return", tickformat=".0%")))
-    fig_hm.update_layout(template="plotly_dark", height=max(300,len(hd)*35+100),
-                         margin=dict(l=60,r=30,t=30,b=40), yaxis=dict(autorange="reversed"))
-    st.plotly_chart(fig_hm, use_container_width=True)
-
-    # ── ROLLING STATS ──
-    st.markdown("---")
-    st.subheader("Rolling Statistics (252-Day)")
-    rr = df_bt["Strat_Net"].rolling(252, min_periods=126)
-    r_ann = rr.mean() * 252
-    r_vol = rr.std() * np.sqrt(252)
-    r_sh = r_ann / r_vol
-    fig_r = make_subplots(specs=[[{"secondary_y": True}]])
-    fig_r.add_trace(go.Scatter(x=df_bt["Date"], y=r_sh, name="Rolling Sharpe",
-                               line=dict(color="#00D4AA", width=2)), secondary_y=False)
-    fig_r.add_trace(go.Scatter(x=df_bt["Date"], y=r_ann, name="Rolling Ann. Return",
-                               line=dict(color="#F5A623", width=1.5, dash="dash")), secondary_y=True)
-    fig_r.add_hline(y=1.0, line_dash="dot", line_color="rgba(255,255,255,0.3)", secondary_y=False)
-    fig_r.add_hline(y=0.0, line_dash="dot", line_color="rgba(255,255,255,0.2)", secondary_y=False)
-    fig_r.update_layout(template="plotly_dark", height=400, margin=dict(l=60,r=60,t=30,b=40),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    fig_r.update_yaxes(title_text="Sharpe", secondary_y=False)
-    fig_r.update_yaxes(title_text="Ann. Return", tickformat=".0%", secondary_y=True)
-    st.plotly_chart(fig_r, use_container_width=True)
-
-    # ── DISTRIBUTION ──
-    st.markdown("---")
-    st.subheader("Daily P&L Distribution")
-    dr = df_bt["Strat_Net"].dropna()
-    rm, rmed, rsk, rku = dr.mean(), dr.median(), stats.skew(dr), stats.kurtosis(dr)
-    fig_d = go.Figure()
-    fig_d.add_trace(go.Histogram(x=dr, nbinsx=100, marker_color="rgba(0,212,170,0.6)",
-                                 marker_line=dict(color="rgba(0,212,170,1)", width=0.5)))
-    fig_d.add_vline(x=0, line_dash="dash", line_color="rgba(255,255,255,0.5)")
-    fig_d.add_vline(x=rm, line_color="#F5A623", line_width=2,
-                    annotation_text=f"Mean: {rm:.4%}", annotation_position="top right")
-    fig_d.update_layout(template="plotly_dark", xaxis_title="Daily Return", yaxis_title="Frequency",
-                        height=400, margin=dict(l=60,r=30,t=30,b=40),
-                        annotations=[dict(x=0.98, y=0.95, xref="paper", yref="paper",
-                                         text=f"Mean: {rm:.4%}<br>Median: {rmed:.4%}<br>Skew: {rsk:.2f}<br>Kurtosis: {rku:.2f}",
-                                         showarrow=False, font=dict(size=12, color="white"),
-                                         bgcolor="rgba(0,0,0,0.6)", bordercolor="rgba(255,255,255,0.3)",
-                                         borderwidth=1, borderpad=8, align="left")])
-    fig_d.update_xaxes(tickformat=".1%")
-    st.plotly_chart(fig_d, use_container_width=True)
-
+    # ── FOOTER ──
     st.markdown("---")
     st.caption("Brent CTA Backtest Platform. Built with Streamlit.")
 

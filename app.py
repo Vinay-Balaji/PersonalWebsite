@@ -28,7 +28,7 @@ def load_data():
         if test_dates.notna().sum() > len(df) * 0.5:
             result = pd.DataFrame({
                 "Date": pd.to_datetime(df.iloc[:, 0], errors="coerce"),
-                "CO1":  pd.to_numeric(df.iloc[:, 1], errors="coerce"),
+                "CO1": pd.to_numeric(df.iloc[:, 1], errors="coerce"),
             })
             if n_cols >= 4:
                 result["CO12"] = pd.to_numeric(df.iloc[:, 3], errors="coerce")
@@ -82,12 +82,12 @@ def compute_signals(df_daily, signals_config):
             month_ends["TSMOM"] = pd.concat(components, axis=1).mean(axis=1).values
         else:
             month_ends["TSMOM"] = 0.0
-        signal_columns["TSMOM"] = signals_config["tsmom"]["norm_weight"]
+        signal_columns["TSMOM"] = signals_config["tsmom"]["weight"]
 
     if signals_config["carry"]["enabled"]:
         month_ends["Carry_Spread"] = (month_ends["CO1"] - month_ends["CO12"]) / month_ends["CO1"]
         month_ends["Carry"] = np.sign(month_ends["Carry_Spread"])
-        signal_columns["Carry"] = signals_config["carry"]["norm_weight"]
+        signal_columns["Carry"] = signals_config["carry"]["weight"]
 
     if signals_config["ichimoku"]["enabled"]:
         tp = signals_config["ichimoku"]["tenkan"]
@@ -103,7 +103,7 @@ def compute_signals(df_daily, signals_config):
         ichi_signal[prices > cloud_top] = 1.0
         ichi_signal[prices < cloud_bot] = -1.0
         month_ends["Ichimoku"] = ichi_signal.loc[month_ends.index].values
-        signal_columns["Ichimoku"] = signals_config["ichimoku"]["norm_weight"]
+        signal_columns["Ichimoku"] = signals_config["ichimoku"]["weight"]
 
     if signals_config["tma"]["enabled"]:
         period = signals_config["tma"]["period"]
@@ -111,7 +111,7 @@ def compute_signals(df_daily, signals_config):
         tma = first_sma.rolling(period, min_periods=period // 2).mean()
         tma_signal = np.sign(prices - tma)
         month_ends["TMA"] = tma_signal.loc[month_ends.index].values
-        signal_columns["TMA"] = signals_config["tma"]["norm_weight"]
+        signal_columns["TMA"] = signals_config["tma"]["weight"]
 
     if not signal_columns:
         month_ends["Composite"] = 0.0
@@ -197,7 +197,7 @@ def main():
 
     df_raw = load_data()
     if df_raw is None:
-        st.error("**bloomberg_data.xlsx** (or .csv) not found. Place your Bloomberg data export in the same directory.")
+        st.error("**bloomberg_data.xlsx** (or .csv) not found.")
         st.stop()
     if len(df_raw) < 252:
         st.error(f"Only {len(df_raw)} rows. Need at least 252.")
@@ -205,6 +205,15 @@ def main():
 
     min_date = df_raw["Date"].min().date()
     max_date = df_raw["Date"].max().date()
+
+    # ── Init session state for weights ──
+    all_dir = ["TSMOM", "Carry", "Ichimoku", "TMA"]
+    defaults = {"TSMOM": 35, "Carry": 30, "Ichimoku": 20, "TMA": 15}
+    for s in all_dir:
+        if f"w_{s}" not in st.session_state:
+            st.session_state[f"w_{s}"] = defaults[s]
+    if "prev_enabled" not in st.session_state:
+        st.session_state["prev_enabled"] = set(all_dir)
 
     with st.sidebar:
         st.header("Backtest Settings")
@@ -216,12 +225,11 @@ def main():
         df_filt = df_raw[(df_raw["Date"] >= pd.Timestamp(start_date)) & (df_raw["Date"] <= pd.Timestamp(end_date))]
         st.caption(f"{start_date} to {end_date} — {len(df_filt):,} days, {df_filt['Date'].dt.to_period('M').nunique()} months")
 
-        # ── Directional Signals ──
+        # ── Signal toggles + params ──
         st.divider()
         tsmom_on = st.toggle("Signal 1 — TSMOM", value=True, key="tsmom_on")
         if tsmom_on:
             st.caption("Rides the trend. Long if up, short if down.")
-            tsmom_w = st.slider("Relative Weight", 0.05, 1.0, 0.35, 0.05, key="tw")
             lb_opts = {"21d (~1M)": 21, "42d (~2M)": 42, "63d (~3M)": 63,
                        "126d (~6M)": 126, "189d (~9M)": 189, "252d (~12M)": 252}
             sel = st.multiselect("Lookback Windows", list(lb_opts.keys()),
@@ -231,15 +239,12 @@ def main():
                 st.error("Select at least one lookback.")
                 st.stop()
         else:
-            tsmom_w = 0; lookbacks = [21, 63, 252]
+            lookbacks = [21, 63, 252]
 
         st.divider()
         carry_on = st.toggle("Signal 2 — Carry", value=True, key="carry_on")
         if carry_on:
             st.caption("Trades the curve. Long in backwardation, short in contango.")
-            carry_w = st.slider("Relative Weight", 0.05, 1.0, 0.30, 0.05, key="cw")
-        else:
-            carry_w = 0
 
         st.divider()
         vol_on = st.toggle("Signal 3 — Vol Targeting", value=True, key="vol_on")
@@ -255,49 +260,92 @@ def main():
         ichi_on = st.toggle("Signal 4 — Ichimoku Cloud", value=True, key="ichi_on")
         if ichi_on:
             st.caption("Japanese trend system. Long above cloud, short below.")
-            ichi_w = st.slider("Relative Weight", 0.05, 1.0, 0.20, 0.05, key="iw")
             ichi_tenkan = st.number_input("Tenkan Period", 5, 30, 9, key="it")
             ichi_kijun = st.number_input("Kijun Period", 10, 60, 26, key="ik")
             ichi_senkou = st.number_input("Senkou Period", 20, 120, 52, key="is")
         else:
-            ichi_w = 0; ichi_tenkan = 9; ichi_kijun = 26; ichi_senkou = 52
+            ichi_tenkan = 9; ichi_kijun = 26; ichi_senkou = 52
 
         st.divider()
         tma_on = st.toggle("Signal 5 — Triangular MA", value=True, key="tma_on")
         if tma_on:
             st.caption("Double-smoothed MA. Long above, short below.")
-            tma_w = st.slider("Relative Weight", 0.05, 1.0, 0.15, 0.05, key="tmaw")
             tma_period = st.slider("Period (days)", 10, 200, 50, 5, key="tmap")
         else:
-            tma_w = 0; tma_period = 50
+            tma_period = 50
 
-        # ── Normalize weights to sum to 1.0 ──
-        enabled = []
-        if tsmom_on: enabled.append(("TSMOM", tsmom_w))
-        if carry_on: enabled.append(("Carry", carry_w))
-        if ichi_on: enabled.append(("Ichimoku", ichi_w))
-        if tma_on: enabled.append(("TMA", tma_w))
-        if not enabled:
+        # ── Weight allocation ──
+        enabled_dir = []
+        if tsmom_on: enabled_dir.append("TSMOM")
+        if carry_on: enabled_dir.append("Carry")
+        if ichi_on: enabled_dir.append("Ichimoku")
+        if tma_on: enabled_dir.append("TMA")
+
+        if not enabled_dir:
             st.divider()
             st.error("Enable at least one directional signal.")
             st.stop()
 
-        raw_total = sum(w for _, w in enabled)
-        norm_weights = {name: w / raw_total for name, w in enabled}
+        # Detect toggle changes and redistribute evenly
+        curr_enabled = set(enabled_dir)
+        if curr_enabled != st.session_state["prev_enabled"]:
+            each = 100 // len(enabled_dir)
+            remainder = 100 - each * len(enabled_dir)
+            for i, s in enumerate(enabled_dir):
+                st.session_state[f"w_{s}"] = each + (1 if i < remainder else 0)
+            for s in all_dir:
+                if s not in enabled_dir:
+                    st.session_state[f"w_{s}"] = 0
+            st.session_state["prev_enabled"] = curr_enabled
+
+        # Rebalance callback: when one slider moves, adjust others proportionally
+        def rebalance(changed):
+            new_val = st.session_state[f"w_{changed}"]
+            new_val = min(max(new_val, 0), 100)
+            others = [s for s in enabled_dir if s != changed]
+            if not others:
+                st.session_state[f"w_{changed}"] = 100
+                return
+            remaining = 100 - new_val
+            other_total = sum(st.session_state[f"w_{s}"] for s in others)
+            if other_total > 0:
+                scale = remaining / other_total
+                for s in others:
+                    st.session_state[f"w_{s}"] = max(0, int(round(st.session_state[f"w_{s}"] * scale)))
+            else:
+                each = remaining // len(others)
+                for s in others:
+                    st.session_state[f"w_{s}"] = each
+            # Fix rounding
+            actual_total = new_val + sum(st.session_state[f"w_{s}"] for s in others)
+            if actual_total != 100:
+                st.session_state[f"w_{others[0]}"] += 100 - actual_total
 
         st.divider()
-        st.markdown("**Normalized Weights (always sum to 100%)**")
-        for name, nw in norm_weights.items():
-            st.caption(f"  {name}: {nw:.0%}")
-        st.caption(f"  Vol Target: {vol_target_pct}%" if vol_on else "  Vol Target: off")
+        st.markdown("**Weight Allocation**")
+        if len(enabled_dir) == 1:
+            st.caption(f"{enabled_dir[0]}: 100%")
+            st.session_state[f"w_{enabled_dir[0]}"] = 100
+        else:
+            for sig in enabled_dir:
+                st.slider(f"{sig} %", 0, 100, key=f"w_{sig}", step=5,
+                          on_change=rebalance, args=(sig,))
+
+        # Read final weights as decimals
+        norm_weights = {}
+        for s in enabled_dir:
+            norm_weights[s] = st.session_state[f"w_{s}"] / 100.0
+
+        wt = sum(st.session_state[f"w_{s}"] for s in enabled_dir)
+        st.caption(f"Total: {wt}%  |  Vol Target: {vol_target_pct}%" if vol_on else f"Total: {wt}%  |  Vol Target: off")
 
     # ── BUILD CONFIG ──
     signals_config = {
-        "tsmom": {"enabled": tsmom_on, "norm_weight": norm_weights.get("TSMOM", 0), "lookbacks": lookbacks},
-        "carry": {"enabled": carry_on, "norm_weight": norm_weights.get("Carry", 0)},
-        "ichimoku": {"enabled": ichi_on, "norm_weight": norm_weights.get("Ichimoku", 0),
+        "tsmom": {"enabled": tsmom_on, "weight": norm_weights.get("TSMOM", 0), "lookbacks": lookbacks},
+        "carry": {"enabled": carry_on, "weight": norm_weights.get("Carry", 0)},
+        "ichimoku": {"enabled": ichi_on, "weight": norm_weights.get("Ichimoku", 0),
                      "tenkan": ichi_tenkan, "kijun": ichi_kijun, "senkou": ichi_senkou},
-        "tma": {"enabled": tma_on, "norm_weight": norm_weights.get("TMA", 0), "period": tma_period},
+        "tma": {"enabled": tma_on, "weight": norm_weights.get("TMA", 0), "period": tma_period},
     }
     vol_config = {"enabled": vol_on, "target": vol_target, "lookback": vol_lookback}
 
@@ -308,13 +356,13 @@ def main():
     lb_start = pd.Timestamp(start_date) - pd.Timedelta(days=int(max_lb * 1.6))
     df_lb = df_raw[df_raw["Date"] >= lb_start].copy()
     if len(df_lb) < max_lb:
-        st.error(f"Not enough data for lookback. Need ~{max_lb} days before start date.")
+        st.error(f"Not enough data for lookback.")
         st.stop()
 
     df_signals, active_names = compute_signals(df_lb, signals_config)
     df_signals_bt = df_signals[df_signals["Date"] <= pd.Timestamp(end_date)].copy()
     if len(df_signals_bt) < 3:
-        st.error("Not enough signal months. Widen your date range.")
+        st.error("Not enough signal months.")
         st.stop()
 
     df_daily_bt = df_lb[(df_lb["Date"] >= pd.Timestamp(start_date)) & (df_lb["Date"] <= pd.Timestamp(end_date))].copy()

@@ -17,17 +17,42 @@ st.set_page_config(page_title="Brent CTA Backtest", layout="wide", initial_sideb
 
 @st.cache_data
 def load_data():
+    # Read file
     if os.path.exists("bloomberg_data.xlsx"):
-        df = pd.read_excel("bloomberg_data.xlsx")
+        # Try with no header first (raw BDH format)
+        df = pd.read_excel("bloomberg_data.xlsx", header=None)
     elif os.path.exists("bloomberg_data.csv"):
         df = pd.read_csv("bloomberg_data.csv")
     else:
         return None
 
-    # Fix column names — convert datetime objects to strings (Bloomberg Excel export bug)
+    # ── Detect raw BDH format ──
+    # BDH creates date-value pairs: A=dates, B=CO1, C=dates, D=CO12, E=dates, F=OVX, G=dates, H=VIX
+    # No headers, 8 columns, columns 0/2/4/6 are dates
+    n_cols = len(df.columns)
+
+    if n_cols >= 8:
+        # Check if first column looks like dates
+        test_dates = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+        if test_dates.notna().sum() > len(df) * 0.5:
+            # Raw BDH format detected — reshape
+            df = pd.DataFrame({
+                "Date": pd.to_datetime(df.iloc[:, 0], errors="coerce"),
+                "CO1":  pd.to_numeric(df.iloc[:, 1], errors="coerce"),
+                "CO12": pd.to_numeric(df.iloc[:, 3], errors="coerce"),
+                "OVX":  pd.to_numeric(df.iloc[:, 5], errors="coerce"),
+                "VIX":  pd.to_numeric(df.iloc[:, 7], errors="coerce"),
+            })
+            df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+            df[["CO1","CO12","OVX","VIX"]] = df[["CO1","CO12","OVX","VIX"]].ffill().bfill()
+            df = df.dropna(subset=["CO1","CO12","OVX","VIX"]).reset_index(drop=True)
+            return df
+
+    # ── Fallback: named columns (CSV or manually formatted xlsx) ──
+    # Fix column names — convert datetime objects to strings
     df.columns = [str(c).strip() if not isinstance(c, datetime) else "Date" for c in df.columns]
 
-    # Find the date column
+    # Find date column
     date_col = None
     for col in df.columns:
         if str(col).strip().lower() == "date":
@@ -54,13 +79,15 @@ def load_data():
     for col in required:
         if col not in df.columns:
             st.error(f"Missing column: {col}. Expected: {required}")
+            st.info("If using raw Bloomberg BDH, make sure your file has 8 columns: "
+                    "4 date-value pairs for CO1, CO12, OVX, VIX in cells A1, C1, E1, G1.")
             st.stop()
 
     for col in ["CO1", "CO12", "OVX", "VIX"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df[["CO1", "CO12", "OVX", "VIX"]] = df[["CO1", "CO12", "OVX", "VIX"]].ffill().bfill()
-    df = df.dropna(subset=["CO1", "CO12", "OVX", "VIX"]).reset_index(drop=True)
+    df[["CO1","CO12","OVX","VIX"]] = df[["CO1","CO12","OVX","VIX"]].ffill().bfill()
+    df = df.dropna(subset=["CO1","CO12","OVX","VIX"]).reset_index(drop=True)
     return df
 
 

@@ -1,6 +1,6 @@
 """
 BRENT CRUDE OIL CTA STRATEGY — Backtest Platform
-TSMOM + Carry + Vol Targeting
+TSMOM + Carry + Vol Targeting + Ichimoku + Triangular MA
 """
 
 import streamlit as st
@@ -24,8 +24,6 @@ def load_data():
         return None
 
     n_cols = len(df.columns)
-
-    # Detect raw BDH: 4+ columns, cols 0/2 are dates, cols 1/3 are prices
     if n_cols >= 4:
         test_dates = pd.to_datetime(df.iloc[:, 0], errors="coerce")
         if test_dates.notna().sum() > len(df) * 0.5:
@@ -33,17 +31,15 @@ def load_data():
                 "Date": pd.to_datetime(df.iloc[:, 0], errors="coerce"),
                 "CO1":  pd.to_numeric(df.iloc[:, 1], errors="coerce"),
             })
-            # CO12 in column D (index 3) if available
             if n_cols >= 4:
                 result["CO12"] = pd.to_numeric(df.iloc[:, 3], errors="coerce")
             else:
-                result["CO12"] = result["CO1"]  # fallback
+                result["CO12"] = result["CO1"]
             result = result.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
             result[["CO1","CO12"]] = result[["CO1","CO12"]].ffill().bfill()
             result = result.dropna(subset=["CO1","CO12"]).reset_index(drop=True)
             return result
 
-    # Fallback: named columns
     df.columns = [str(c).strip() if not isinstance(c, datetime) else "Date" for c in df.columns]
     date_col = None
     for col in df.columns:
@@ -71,46 +67,103 @@ def load_data():
     return df
 
 
-def compute_signals(df_daily, tsmom_weight, carry_weight, lookbacks):
-    """Compute TSMOM and Carry signals at month-end."""
+def compute_signals(df_daily, signals_config):
+    """Compute all enabled signals at month-end."""
     df = df_daily.copy().set_index("Date")
     df["YM"] = df.index.to_period("M")
     month_ends = df.groupby("YM").tail(1).copy()
+    prices = df["CO1"]
 
-    # TSMOM
-    tsmom_components = []
-    for lb in lookbacks:
-        ret = df["CO1"].pct_change(lb)
-        tsmom_components.append(np.sign(ret.loc[month_ends.index]))
-    if len(tsmom_components) > 0:
-        month_ends["TSMOM"] = pd.concat(tsmom_components, axis=1).mean(axis=1).values
+    signal_columns = {}  # name -> series of signal values at month-ends
+
+    # ── TSMOM ──
+    if signals_config["tsmom"]["enabled"]:
+        lookbacks = signals_config["tsmom"]["lookbacks"]
+        components = []
+        for lb in lookbacks:
+            ret = prices.pct_change(lb)
+            components.append(np.sign(ret.loc[month_ends.index]))
+        if components:
+            month_ends["TSMOM"] = pd.concat(components, axis=1).mean(axis=1).values
+        else:
+            month_ends["TSMOM"] = 0.0
+        signal_columns["TSMOM"] = signals_config["tsmom"]["weight"]
+
+    # ── CARRY ──
+    if signals_config["carry"]["enabled"]:
+        month_ends["Carry_Spread"] = (month_ends["CO1"] - month_ends["CO12"]) / month_ends["CO1"]
+        month_ends["Carry"] = np.sign(month_ends["Carry_Spread"])
+        signal_columns["Carry"] = signals_config["carry"]["weight"]
+
+    # ── ICHIMOKU ──
+    if signals_config["ichimoku"]["enabled"]:
+        tenkan_p = signals_config["ichimoku"]["tenkan"]
+        kijun_p = signals_config["ichimoku"]["kijun"]
+        senkou_p = signals_config["ichimoku"]["senkou"]
+
+        # Tenkan-sen: (highest high + lowest low) / 2 over tenkan_p
+        tenkan = (prices.rolling(tenkan_p).max() + prices.rolling(tenkan_p).min()) / 2
+        # Kijun-sen: same over kijun_p
+        kijun = (prices.rolling(kijun_p).max() + prices.rolling(kijun_p).min()) / 2
+        # Senkou Span A: (tenkan + kijun) / 2, shifted forward kijun_p periods
+        span_a = ((tenkan + kijun) / 2).shift(kijun_p)
+        # Senkou Span B: (highest + lowest) / 2 over senkou_p, shifted forward kijun_p
+        span_b = ((prices.rolling(senkou_p).max() + prices.rolling(senkou_p).min()) / 2).shift(kijun_p)
+
+        # Cloud top and bottom
+        cloud_top = pd.concat([span_a, span_b], axis=1).max(axis=1)
+        cloud_bot = pd.concat([span_a, span_b], axis=1).min(axis=1)
+
+        # Signal: +1 above cloud, -1 below cloud, 0 inside cloud
+        ichi_signal = pd.Series(0.0, index=prices.index)
+        ichi_signal[prices > cloud_top] = 1.0
+        ichi_signal[prices < cloud_bot] = -1.0
+
+        month_ends["Ichimoku"] = ichi_signal.loc[month_ends.index].values
+        signal_columns["Ichimoku"] = signals_config["ichimoku"]["weight"]
+
+    # ── TRIANGULAR MA ──
+    if signals_config["tma"]["enabled"]:
+        period = signals_config["tma"]["period"]
+        # TMA = SMA of SMA — double smoothing
+        first_sma = prices.rolling(period, min_periods=period // 2).mean()
+        tma = first_sma.rolling(period, min_periods=period // 2).mean()
+
+        # Signal: +1 if price > TMA, -1 if price < TMA
+        tma_signal = np.sign(prices - tma)
+        month_ends["TMA"] = tma_signal.loc[month_ends.index].values
+        signal_columns["TMA"] = signals_config["tma"]["weight"]
+
+    # ── COMPOSITE ──
+    if not signal_columns:
+        month_ends["Composite"] = 0.0
     else:
-        month_ends["TSMOM"] = 0.0
+        # Normalize weights of enabled signals to sum to 1
+        total_w = sum(signal_columns.values())
+        if total_w == 0:
+            total_w = 1.0
 
-    # Carry
-    month_ends["Carry_Spread"] = (month_ends["CO1"] - month_ends["CO12"]) / month_ends["CO1"]
-    month_ends["Carry"] = np.sign(month_ends["Carry_Spread"])
+        composite = pd.Series(0.0, index=month_ends.index)
+        for sig_name, raw_weight in signal_columns.items():
+            norm_w = raw_weight / total_w
+            month_ends[f"{sig_name}_Contribution"] = norm_w * month_ends[sig_name]
+            composite += month_ends[f"{sig_name}_Contribution"]
 
-    # Composite (before vol targeting — vol targeting applied in backtest)
-    raw = tsmom_weight * month_ends["TSMOM"] + carry_weight * month_ends["Carry"]
-    month_ends["Composite"] = raw.clip(-1, 1)
-    month_ends["TSMOM_Contribution"] = tsmom_weight * month_ends["TSMOM"]
-    month_ends["Carry_Contribution"] = carry_weight * month_ends["Carry"]
+        month_ends["Composite"] = composite.clip(-1, 1)
 
     month_ends = month_ends.drop(columns=["YM"], errors="ignore").reset_index()
     month_ends = month_ends.rename(columns={"index": "Date"} if "index" in month_ends.columns else {})
     if "Date" not in month_ends.columns and month_ends.index.name == "Date":
         month_ends = month_ends.reset_index()
-    return month_ends
+    return month_ends, list(signal_columns.keys())
 
 
-def run_backtest(df_daily, df_signals, tc, vol_target, vol_lookback):
-    """Run daily backtest with vol targeting."""
+def run_backtest(df_daily, df_signals, vol_config):
+    """Run daily backtest with optional vol targeting."""
     df = df_daily.copy()
     df = df.set_index("Date") if "Date" in df.columns else df.copy()
     df["Market_Ret"] = df["CO1"].pct_change()
 
-    # Map monthly signals to daily
     df_signals_indexed = df_signals.set_index("Date")
     signal_series = df_signals_indexed["Composite"]
     df["Signal"] = np.nan
@@ -123,16 +176,23 @@ def run_backtest(df_daily, df_signals, tc, vol_target, vol_lookback):
         df.loc[mask, "Signal"] = sig_val
     df["Raw_Position"] = df["Signal"].ffill().fillna(0)
 
-    # Vol targeting: scale position so strategy vol stays near target
-    realized_vol = df["Market_Ret"].rolling(vol_lookback, min_periods=max(5, vol_lookback // 4)).std() * np.sqrt(252)
-    df["Realized_Vol"] = realized_vol
-    df["Vol_Scalar"] = (vol_target / realized_vol).clip(0.25, 2.0).fillna(1.0)
-    df["Position"] = df["Raw_Position"] * df["Vol_Scalar"]
+    # Vol targeting
+    if vol_config["enabled"]:
+        vt = vol_config["target"]
+        vl = vol_config["lookback"]
+        realized_vol = df["Market_Ret"].rolling(vl, min_periods=max(5, vl // 4)).std() * np.sqrt(252)
+        df["Realized_Vol"] = realized_vol
+        df["Vol_Scalar"] = (vt / realized_vol).clip(0.25, 2.0).fillna(1.0)
+        df["Position"] = df["Raw_Position"] * df["Vol_Scalar"]
+    else:
+        df["Realized_Vol"] = df["Market_Ret"].rolling(21, min_periods=5).std() * np.sqrt(252)
+        df["Vol_Scalar"] = 1.0
+        df["Position"] = df["Raw_Position"]
 
-    # Strategy returns
     df["Strat_Gross"] = df["Position"] * df["Market_Ret"]
 
-    # Transaction costs
+    # Transaction costs (hardcoded 5bps)
+    tc = 0.0005
     df["Month"] = df.index.to_period("M")
     monthly_pos = df.groupby("Month")["Raw_Position"].first()
     pos_changed = monthly_pos.diff().abs() > 0.01
@@ -145,37 +205,25 @@ def run_backtest(df_daily, df_signals, tc, vol_target, vol_lookback):
 
     df["Strat_Net"] = df["Strat_Gross"] - df["TC"]
     df["Cumulative"] = (1 + df["Strat_Net"].fillna(0)).cumprod()
-
-    # Buy & hold
     df["BH_Ret"] = df["Market_Ret"].fillna(0)
     df["BH_Cumulative"] = (1 + df["BH_Ret"]).cumprod()
-
-    # Drawdown
     df["Drawdown"] = df["Cumulative"] / df["Cumulative"].cummax() - 1
-
     df = df.drop(columns=["Month"], errors="ignore").reset_index()
     return df
 
 
-def compute_stats(df_bt, return_col="Strat_Net", cum_col="Cumulative", rf_annual=0.0):
-    """
-    Compute stats using Bloomberg methodology:
-    Ann Return = mean(daily returns) * 252
-    Ann Vol = std(daily returns) * sqrt(252)
-    Sharpe = (Ann Return - Rf) / Ann Vol
-    """
+def compute_stats(df_bt, return_col="Strat_Net", cum_col="Cumulative"):
+    """Bloomberg-style stats: arithmetic annualization."""
     rets = df_bt[return_col].dropna()
     n_days = len(rets)
     if n_days == 0:
-        return {k: 0 for k in ["ann_ret","ann_vol","sharpe","max_dd","hit_rate","total_ret"]}
+        return {k: 0 for k in ["ann_ret","ann_vol","sharpe","max_dd","hit_rate"]}
 
-    # Bloomberg-style: arithmetic annualization
     ann_ret = rets.mean() * 252
     ann_vol = rets.std() * np.sqrt(252)
-    sharpe = (ann_ret - rf_annual) / ann_vol if ann_vol > 0 else 0
-
-    total_ret = df_bt[cum_col].iloc[-1] - 1
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0
     max_dd = (df_bt[cum_col] / df_bt[cum_col].cummax() - 1).min()
+    total_ret = df_bt[cum_col].iloc[-1] - 1
 
     df_temp = df_bt.copy()
     df_temp["YM"] = pd.to_datetime(df_temp["Date"]).dt.to_period("M")
@@ -188,14 +236,14 @@ def compute_stats(df_bt, return_col="Strat_Net", cum_col="Cumulative", rf_annual
 
 def main():
     st.markdown("# Brent Crude Oil CTA — Backtest Platform")
-    st.markdown("**TSMOM + Carry + Vol Targeting**")
+    st.markdown("**Systematic Long/Short Strategy on Brent Crude Futures**")
 
     df_raw = load_data()
     if df_raw is None:
-        st.error("**bloomberg_data.xlsx** (or .csv) not found. Place your Bloomberg data export in the same directory as this app.")
+        st.error("**bloomberg_data.xlsx** (or .csv) not found. Place your Bloomberg data export in the same directory.")
         st.stop()
     if len(df_raw) < 252:
-        st.error(f"Only {len(df_raw)} rows. Need at least 252 for 12-month lookback.")
+        st.error(f"Only {len(df_raw)} rows. Need at least 252.")
         st.stop()
 
     min_date = df_raw["Date"].min().date()
@@ -209,88 +257,223 @@ def main():
             start_date = st.date_input("Start", value=max(date(2011, 1, 1), min_date), min_value=min_date, max_value=max_date)
         with col2:
             end_date = st.date_input("End", value=max_date, min_value=min_date, max_value=max_date)
-
         df_filt = df_raw[(df_raw["Date"] >= pd.Timestamp(start_date)) & (df_raw["Date"] <= pd.Timestamp(end_date))]
         st.caption(f"{start_date} to {end_date} — {len(df_filt):,} days, {df_filt['Date'].dt.to_period('M').nunique()} months")
 
-        # Signal 1
+        # ── Signal 1: TSMOM ──
         st.divider()
-        st.subheader("Signal 1 — TSMOM")
-        st.caption("Long if trending up, short if down.")
-        tsmom_w = st.slider("Weight", 0.0, 1.0, 0.55, 0.05, key="tw")
-        lb_opts = {"21d (~1M)": 21, "42d (~2M)": 42, "63d (~3M)": 63,
-                   "126d (~6M)": 126, "189d (~9M)": 189, "252d (~12M)": 252}
-        sel = st.multiselect("Lookback Windows", list(lb_opts.keys()), default=["21d (~1M)", "63d (~3M)", "252d (~12M)"])
-        lookbacks = [lb_opts[l] for l in sel]
-        if not lookbacks:
-            st.error("Select at least one lookback.")
+        tsmom_on = st.toggle("Signal 1 — TSMOM", value=True, key="tsmom_on")
+        if tsmom_on:
+            st.caption("Rides the trend. Long if up, short if down.")
+            tsmom_w = st.slider("Weight", 0.0, 1.0, 0.55, 0.05, key="tw")
+            lb_opts = {"21d (~1M)": 21, "42d (~2M)": 42, "63d (~3M)": 63,
+                       "126d (~6M)": 126, "189d (~9M)": 189, "252d (~12M)": 252}
+            sel = st.multiselect("Lookback Windows", list(lb_opts.keys()),
+                                 default=["21d (~1M)", "63d (~3M)", "252d (~12M)"])
+            lookbacks = [lb_opts[l] for l in sel]
+            if not lookbacks:
+                st.error("Select at least one lookback.")
+                st.stop()
+        else:
+            tsmom_w = 0
+            lookbacks = [21, 63, 252]
+
+        # ── Signal 2: Carry ──
+        st.divider()
+        carry_on = st.toggle("Signal 2 — Carry", value=True, key="carry_on")
+        if carry_on:
+            st.caption("Trades the curve shape. Long in backwardation, short in contango.")
+            carry_w = st.slider("Weight", 0.0, 1.0, 0.45, 0.05, key="cw")
+        else:
+            carry_w = 0
+
+        # ── Signal 3: Vol Targeting ──
+        st.divider()
+        vol_on = st.toggle("Signal 3 — Vol Targeting", value=True, key="vol_on")
+        if vol_on:
+            st.caption("Adjusts bet size to keep risk constant.")
+            vol_target_pct = st.slider("Target Volatility (%)", 5, 30, 15, 1)
+            vol_target = vol_target_pct / 100
+            vol_lookback = st.select_slider("Vol Lookback (days)", options=[10, 15, 21, 42, 63], value=21)
+        else:
+            vol_target = 0.15
+            vol_lookback = 21
+
+        # ── Signal 4: Ichimoku ──
+        st.divider()
+        ichi_on = st.toggle("Signal 4 — Ichimoku Cloud", value=False, key="ichi_on")
+        if ichi_on:
+            st.caption("Japanese trend system. Long above cloud, short below.")
+            ichi_w = st.slider("Weight", 0.0, 1.0, 0.30, 0.05, key="iw")
+            ichi_tenkan = st.number_input("Tenkan Period", 5, 30, 9, key="it")
+            ichi_kijun = st.number_input("Kijun Period", 10, 60, 26, key="ik")
+            ichi_senkou = st.number_input("Senkou Period", 20, 120, 52, key="is")
+        else:
+            ichi_w = 0
+            ichi_tenkan, ichi_kijun, ichi_senkou = 9, 26, 52
+
+        # ── Signal 5: Triangular MA ──
+        st.divider()
+        tma_on = st.toggle("Signal 5 — Triangular MA", value=False, key="tma_on")
+        if tma_on:
+            st.caption("Double-smoothed moving average. Long above, short below.")
+            tma_w = st.slider("Weight", 0.0, 1.0, 0.25, 0.05, key="tmaw")
+            tma_period = st.slider("Period (days)", 10, 200, 50, 5, key="tmap")
+        else:
+            tma_w = 0
+            tma_period = 50
+
+        # Weight summary
+        enabled_signals = []
+        if tsmom_on: enabled_signals.append(("TSMOM", tsmom_w))
+        if carry_on: enabled_signals.append(("Carry", carry_w))
+        if ichi_on: enabled_signals.append(("Ichimoku", ichi_w))
+        if tma_on: enabled_signals.append(("TMA", tma_w))
+
+        if not enabled_signals:
+            st.divider()
+            st.error("Enable at least one directional signal.")
             st.stop()
 
-        # Signal 2
         st.divider()
-        st.subheader("Signal 2 — Carry")
-        st.caption("Long in backwardation, short in contango.")
-        carry_w = st.slider("Weight", 0.0, 1.0, 0.45, 0.05, key="cw")
+        total_w = sum(w for _, w in enabled_signals)
+        st.caption("**Active Signals:**")
+        for name, w in enabled_signals:
+            norm_w = w / total_w if total_w > 0 else 0
+            st.caption(f"  {name}: {w:.2f} → normalized {norm_w:.0%}")
+        vol_label = f"  Vol Target: {vol_target_pct}%" if vol_on else "  Vol Target: off"
+        st.caption(vol_label)
 
-        total_w = tsmom_w + carry_w
-        if abs(total_w - 1.0) < 0.001:
-            st.success(f"Total weight: {total_w:.2f}")
-        else:
-            st.warning(f"Total weight: {total_w:.2f} (should be 1.0)")
-
-        # Signal 3
-        st.divider()
-        st.subheader("Signal 3 — Vol Targeting")
-        st.caption("Scales position size to maintain constant risk.")
-        vol_target_pct = st.slider("Target Volatility (%)", 5, 30, 15, 1)
-        vol_target = vol_target_pct / 100
-        vol_lookback = st.select_slider("Vol Lookback (days)", options=[10, 15, 21, 42, 63], value=21)
-
-        # Execution
-        st.divider()
-        st.subheader("Execution")
-        tc_bps = st.number_input("Transaction Cost (bps)", 0, 50, 5)
-        tc = tc_bps / 10000
-        rf_pct = st.number_input("Risk-Free Rate (% annual)", 0.0, 10.0, 4.5, 0.1,
-                                 help="Used for Sharpe calculation. Match Bloomberg's assumption.")
-        rf = rf_pct / 100
+    # ── BUILD CONFIG ──
+    signals_config = {
+        "tsmom": {"enabled": tsmom_on, "weight": tsmom_w, "lookbacks": lookbacks},
+        "carry": {"enabled": carry_on, "weight": carry_w},
+        "ichimoku": {"enabled": ichi_on, "weight": ichi_w,
+                     "tenkan": ichi_tenkan, "kijun": ichi_kijun, "senkou": ichi_senkou},
+        "tma": {"enabled": tma_on, "weight": tma_w, "period": tma_period},
+    }
+    vol_config = {"enabled": vol_on, "target": vol_target, "lookback": vol_lookback}
 
     # ── COMPUTE ──
-    max_lb = max(lookbacks)
+    max_lb = max(lookbacks) if tsmom_on else 252
+    if ichi_on:
+        max_lb = max(max_lb, ichi_senkou + ichi_kijun + 10)
+    if tma_on:
+        max_lb = max(max_lb, tma_period * 2 + 10)
     lb_start = pd.Timestamp(start_date) - pd.Timedelta(days=int(max_lb * 1.6))
     df_lb = df_raw[df_raw["Date"] >= lb_start].copy()
     if len(df_lb) < max_lb:
-        st.error(f"Not enough data for {max_lb}-day lookback.")
+        st.error(f"Not enough data for lookback. Need ~{max_lb} days before start date.")
         st.stop()
 
-    df_signals = compute_signals(df_lb, tsmom_w, carry_w, lookbacks)
+    df_signals, active_names = compute_signals(df_lb, signals_config)
     df_signals_bt = df_signals[df_signals["Date"] <= pd.Timestamp(end_date)].copy()
     if len(df_signals_bt) < 3:
         st.error("Not enough signal months. Widen your date range.")
         st.stop()
 
     df_daily_bt = df_lb[(df_lb["Date"] >= pd.Timestamp(start_date)) & (df_lb["Date"] <= pd.Timestamp(end_date))].copy()
-    df_bt = run_backtest(df_daily_bt, df_signals_bt, tc, vol_target, vol_lookback)
+    df_bt = run_backtest(df_daily_bt, df_signals_bt, vol_config)
     df_bt = df_bt.dropna(subset=["Strat_Net","Cumulative"]).reset_index(drop=True)
     if len(df_bt) == 0:
         st.error("No backtest results.")
         st.stop()
 
-    ss = compute_stats(df_bt, "Strat_Net", "Cumulative", rf)
-    bh = compute_stats(df_bt, "BH_Ret", "BH_Cumulative", rf)
+    ss = compute_stats(df_bt, "Strat_Net", "Cumulative")
+    bh = compute_stats(df_bt, "BH_Ret", "BH_Cumulative")
 
-    # ── OVERVIEW ──
-    with st.expander("Strategy Overview", expanded=False):
-        st.markdown(f"""
-        **Two signals + vol targeting on Brent crude oil futures (CO1 Comdty):**
-        - **TSMOM:** Long if Brent trending up across multiple lookback windows, short if down.
-        - **Carry:** Long in backwardation (CO1 > CO12), short in contango (CO1 < CO12).
-        - **Vol Targeting:** Scales position daily so the strategy runs at ~{vol_target_pct}% annualized volatility. When Brent vol is low, lever up. When vol spikes, scale down.
+    # ── STRATEGY OVERVIEW ──
+    with st.expander("Strategy Overview — How Each Signal Works", expanded=False):
+        st.markdown("""
+        ### Signal 1 — TSMOM (Time-Series Momentum)
 
-        **Composite = (TSMOM_w × TSMOM + Carry_w × Carry) × Vol Scalar.** Signals rebalanced monthly. Vol scalar updated daily.
+        Imagine watching the price of oil over the past few months. If it has been going **up**, this signal says
+        "the trend is likely to continue — **go long**." If it has been going **down**, it says "the downtrend will
+        probably keep going — **go short**."
 
-        **Sharpe Methodology:** Matches Bloomberg — arithmetic annualization (mean × 252 / std × √252), excess return over {rf_pct:.1f}% risk-free rate.
-        Buy & Hold uses raw CO1 front-month returns which include roll gaps; Bloomberg's reported B&H Sharpe uses a roll-adjusted index.
+        We look at three different time windows — for example, the past 1 month, 3 months, and 12 months — and
+        check whether each one is positive or negative. Then we average them together. This way we catch both
+        quick short-term moves AND long slow trends. If all three windows agree (all up or all down), the signal
+        is strongest. If they disagree, the signal is weaker.
+
+        **Why it works:** Markets tend to trend. When oil starts moving in one direction — whether because of
+        OPEC cuts, a demand surge, or a geopolitical crisis — it usually keeps moving that way for weeks or months
+        before reversing. TSMOM captures that persistence.
+
+        ---
+
+        ### Signal 2 — Carry (Term Structure)
+
+        Oil futures trade at different prices depending on when the oil will be delivered. The "front month" (CO1)
+        is oil for delivery soon. The "12-month deferred" (CO12) is oil for delivery a year from now.
+
+        When today's oil costs **more** than oil a year out, the curve is in **backwardation**. This usually means
+        physical supply is tight right now — refineries need oil urgently and are willing to pay a premium.
+        That is bullish, so we **go long**.
+
+        When today's oil costs **less** than oil a year out, the curve is in **contango**. This means there is
+        plenty of supply sitting around — storage tanks are filling up. That is bearish, so we **go short**.
+
+        **Why it works:** The shape of the futures curve reflects real supply and demand fundamentals. Backwardation
+        also means you earn positive "roll yield" just by holding the position — the futures price converges up
+        toward spot as expiry approaches.
+
+        ---
+
+        ### Signal 3 — Vol Targeting (Position Sizing)
+
+        This is not a directional signal — it does not tell you to go long or short. Instead, it adjusts how
+        **big** your position is based on how volatile the market is right now.
+
+        Some months oil barely moves — maybe 0.5% per day. Other months it swings 3-5% daily. If you hold the
+        same position size in both environments, your risk is wildly inconsistent. Vol targeting fixes this.
+
+        It works by dividing your **target volatility** (e.g., 15%) by the **current realized volatility**.
+        If realized vol is 30%, your position gets cut in half (15/30 = 0.5x). If realized vol is 10%,
+        your position gets levered up (15/10 = 1.5x).
+
+        **Why it works:** It prevents one crazy week from destroying your returns. Your good months get slightly
+        smaller, but your blowup months get much smaller. The net effect is a smoother equity curve and better
+        risk-adjusted returns (higher Sharpe ratio).
+
+        ---
+
+        ### Signal 4 — Ichimoku Cloud (GOC)
+
+        The Ichimoku Cloud is a Japanese trend-following system developed in the 1960s. It creates a shaded
+        "cloud" on the price chart using averages of recent highs and lows over different time windows.
+
+        The cloud has a top edge and a bottom edge. When the price is **above** the entire cloud, the trend is
+        clearly bullish — **go long**. When the price is **below** the entire cloud, the trend is bearish —
+        **go short**. When the price is **inside** the cloud, the market is undecided and choppy — **stay flat**
+        (signal = 0).
+
+        The cloud uses three periods: a short window (Tenkan, default 9 days), a medium window (Kijun, default
+        26 days), and a long window (Senkou, default 52 days). These create a forward-looking zone that acts
+        like dynamic support and resistance.
+
+        **Why it works:** The cloud combines trend direction, momentum, and support/resistance into one indicator.
+        The "inside the cloud = flat" feature helps avoid whipsaws during choppy, trendless markets — which is
+        where most pure momentum strategies lose money.
+
+        ---
+
+        ### Signal 5 — Triangular Moving Average (TMA)
+
+        A Triangular Moving Average is a double-smoothed version of the price. It takes a Simple Moving Average
+        (SMA) of the price, then takes another SMA of that result. This double-smoothing removes most of the
+        day-to-day noise and gives you a very clean trend line.
+
+        When the actual price is **above** this super-smooth line, momentum is up — **go long**.
+        When the price is **below** it, momentum is down — **go short**.
+
+        Compared to a regular moving average, the TMA reacts more slowly. This means fewer false signals and
+        less whipsaw, but it also means slightly later entries and exits. It works best as a confirmation tool
+        alongside faster signals like TSMOM.
+
+        **Why it works:** By smoothing twice, the TMA filters out random noise and only responds to real,
+        sustained price movements. It is especially effective in trending commodity markets where the underlying
+        move lasts for months.
         """)
 
     # ── PERFORMANCE ──
@@ -328,33 +511,25 @@ def main():
                       xaxis=dict(rangeslider=dict(visible=True)))
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── DRAWDOWN ──
-    st.subheader("Drawdown")
-    fig_dd = go.Figure()
-    fig_dd.add_trace(go.Scatter(x=df_bt["Date"], y=df_bt["Drawdown"], fill="tozeroy",
-                                line=dict(color="#FF4B4B", width=1), fillcolor="rgba(255,75,75,0.3)"))
-    fig_dd.update_layout(template="plotly_dark", yaxis_title="Drawdown", yaxis_tickformat=".0%",
-                         height=350, margin=dict(l=60,r=30,t=30,b=40))
-    st.plotly_chart(fig_dd, use_container_width=True)
-
-    # ── VOL TARGETING IN ACTION ──
-    st.markdown("---")
-    st.subheader("Vol Targeting")
-    fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
-    fig_vol.add_trace(go.Scatter(x=df_bt["Date"], y=df_bt["Realized_Vol"],
-                                 name="Realized Vol (ann.)", line=dict(color="#F5A623", width=1.5)),
-                      secondary_y=False)
-    fig_vol.add_hline(y=vol_target, line_dash="dash", line_color="#00D4AA", line_width=2,
-                      annotation_text=f"Target: {vol_target_pct}%", secondary_y=False)
-    fig_vol.add_trace(go.Scatter(x=df_bt["Date"], y=df_bt["Vol_Scalar"],
-                                 name="Vol Scalar", line=dict(color="#4A90D9", width=1, dash="dot")),
-                      secondary_y=True)
-    fig_vol.update_layout(template="plotly_dark", height=400,
-                          margin=dict(l=60,r=60,t=30,b=40),
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    fig_vol.update_yaxes(title_text="Annualized Vol", tickformat=".0%", secondary_y=False)
-    fig_vol.update_yaxes(title_text="Position Scalar", secondary_y=True)
-    st.plotly_chart(fig_vol, use_container_width=True)
+    # ── VOL TARGETING ──
+    if vol_on:
+        st.markdown("---")
+        st.subheader("Vol Targeting")
+        fig_vol = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_vol.add_trace(go.Scatter(x=df_bt["Date"], y=df_bt["Realized_Vol"],
+                                     name="Realized Vol", line=dict(color="#F5A623", width=1.5)),
+                          secondary_y=False)
+        fig_vol.add_hline(y=vol_target, line_dash="dash", line_color="#00D4AA", line_width=2,
+                          annotation_text=f"Target: {vol_target_pct}%", secondary_y=False)
+        fig_vol.add_trace(go.Scatter(x=df_bt["Date"], y=df_bt["Vol_Scalar"],
+                                     name="Position Scalar", line=dict(color="#4A90D9", width=1, dash="dot")),
+                          secondary_y=True)
+        fig_vol.update_layout(template="plotly_dark", height=400,
+                              margin=dict(l=60,r=60,t=30,b=40),
+                              legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        fig_vol.update_yaxes(title_text="Annualized Vol", tickformat=".0%", secondary_y=False)
+        fig_vol.update_yaxes(title_text="Scalar", secondary_y=True)
+        st.plotly_chart(fig_vol, use_container_width=True)
 
     # ── SIGNALS ──
     st.markdown("---")
@@ -374,10 +549,12 @@ def main():
     with cr:
         st.markdown("**Signal Contribution Breakdown**")
         fig_c = go.Figure()
-        fig_c.add_trace(go.Bar(x=df_sig_disp["Date"], y=df_sig_disp["TSMOM_Contribution"],
-                               name="TSMOM", marker_color="#4A90D9"))
-        fig_c.add_trace(go.Bar(x=df_sig_disp["Date"], y=df_sig_disp["Carry_Contribution"],
-                               name="Carry", marker_color="#F5A623"))
+        color_map = {"TSMOM": "#4A90D9", "Carry": "#F5A623", "Ichimoku": "#E74C3C", "TMA": "#9B59B6"}
+        for sig_name in active_names:
+            contrib_col = f"{sig_name}_Contribution"
+            if contrib_col in df_sig_disp.columns:
+                fig_c.add_trace(go.Bar(x=df_sig_disp["Date"], y=df_sig_disp[contrib_col],
+                                       name=sig_name, marker_color=color_map.get(sig_name, "#888")))
         fig_c.update_layout(template="plotly_dark", barmode="relative", height=400,
                             margin=dict(l=60,r=30,t=30,b=40),
                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -387,7 +564,14 @@ def main():
     # ── DETAIL TABLE ──
     st.markdown("---")
     st.subheader("Monthly Detail")
-    dmd = df_sig_disp[["Date","CO1","CO12","Carry_Spread","TSMOM","Carry","Composite"]].copy()
+
+    # Build display columns dynamically
+    base_cols = ["Date", "CO1", "CO12"]
+    if "Carry_Spread" in df_sig_disp.columns: base_cols.append("Carry_Spread")
+    for sig in active_names:
+        if sig in df_sig_disp.columns: base_cols.append(sig)
+    base_cols.append("Composite")
+    dmd = df_sig_disp[[c for c in base_cols if c in df_sig_disp.columns]].copy()
 
     bt_t = df_bt.copy()
     bt_t["YM"] = pd.to_datetime(bt_t["Date"]).dt.to_period("M")
@@ -395,28 +579,31 @@ def main():
     m_mr = bt_t.groupby("YM")["Market_Ret"].apply(lambda x: (1+x).prod()-1)
     m_sc = (1+m_sr).cumprod()
     m_bc = (1+m_mr).cumprod()
-    # Average vol scalar per month
     m_vs = bt_t.groupby("YM")["Vol_Scalar"].mean()
 
     dmd["YM"] = pd.to_datetime(dmd["Date"]).dt.to_period("M")
-    dmd = dmd.merge(m_vs.rename("Avg Vol Scalar"), left_on="YM", right_index=True, how="left")
+    if vol_on:
+        dmd = dmd.merge(m_vs.rename("Vol Scalar"), left_on="YM", right_index=True, how="left")
     dmd = dmd.merge(m_sr.rename("Strat Ret"), left_on="YM", right_index=True, how="left")
     dmd = dmd.merge(m_mr.rename("Mkt Ret"), left_on="YM", right_index=True, how="left")
     dmd = dmd.merge(m_sc.rename("Cum Strat"), left_on="YM", right_index=True, how="left")
     dmd = dmd.merge(m_bc.rename("Cum B&H"), left_on="YM", right_index=True, how="left")
     dmd = dmd.drop(columns=["YM"])
     dmd["Date"] = dmd["Date"].dt.strftime("%Y-%m-%d")
-    dmd = dmd.rename(columns={"Carry_Spread": "Carry Spread"})
+    if "Carry_Spread" in dmd.columns:
+        dmd = dmd.rename(columns={"Carry_Spread": "Carry Spread"})
 
-    fmt = {"CO1":"${:.2f}", "CO12":"${:.2f}", "Carry Spread":"{:.2%}",
-           "TSMOM":"{:+.3f}", "Carry":"{:+.3f}", "Composite":"{:+.3f}",
-           "Avg Vol Scalar":"{:.2f}",
-           "Strat Ret":"{:.2%}", "Mkt Ret":"{:.2%}",
-           "Cum Strat":"{:.4f}", "Cum B&H":"{:.4f}"}
+    # Build format dict dynamically
+    fmt = {"CO1":"${:.2f}", "CO12":"${:.2f}", "Composite":"{:+.3f}",
+           "Strat Ret":"{:.2%}", "Mkt Ret":"{:.2%}", "Cum Strat":"{:.4f}", "Cum B&H":"{:.4f}"}
+    if "Carry Spread" in dmd.columns: fmt["Carry Spread"] = "{:.2%}"
+    if "Vol Scalar" in dmd.columns: fmt["Vol Scalar"] = "{:.2f}"
+    for sig in active_names:
+        if sig in dmd.columns: fmt[sig] = "{:+.3f}"
+
     st.dataframe(dmd.style.format(fmt), use_container_width=True, height=400)
     st.download_button("Download Monthly Detail", dmd.to_csv(index=False), "monthly_detail.csv", "text/csv")
 
-    # ── FOOTER ──
     st.markdown("---")
     st.caption("Brent CTA Backtest Platform. Built with Streamlit.")
 

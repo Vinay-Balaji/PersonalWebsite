@@ -68,15 +68,12 @@ def load_data():
 
 
 def compute_signals(df_daily, signals_config):
-    """Compute all enabled signals at month-end."""
     df = df_daily.copy().set_index("Date")
     df["YM"] = df.index.to_period("M")
     month_ends = df.groupby("YM").tail(1).copy()
     prices = df["CO1"]
+    signal_columns = {}
 
-    signal_columns = {}  # name -> series of signal values at month-ends
-
-    # ── TSMOM ──
     if signals_config["tsmom"]["enabled"]:
         lookbacks = signals_config["tsmom"]["lookbacks"]
         components = []
@@ -89,66 +86,46 @@ def compute_signals(df_daily, signals_config):
             month_ends["TSMOM"] = 0.0
         signal_columns["TSMOM"] = signals_config["tsmom"]["weight"]
 
-    # ── CARRY ──
     if signals_config["carry"]["enabled"]:
         month_ends["Carry_Spread"] = (month_ends["CO1"] - month_ends["CO12"]) / month_ends["CO1"]
         month_ends["Carry"] = np.sign(month_ends["Carry_Spread"])
         signal_columns["Carry"] = signals_config["carry"]["weight"]
 
-    # ── ICHIMOKU ──
     if signals_config["ichimoku"]["enabled"]:
-        tenkan_p = signals_config["ichimoku"]["tenkan"]
-        kijun_p = signals_config["ichimoku"]["kijun"]
-        senkou_p = signals_config["ichimoku"]["senkou"]
-
-        # Tenkan-sen: (highest high + lowest low) / 2 over tenkan_p
-        tenkan = (prices.rolling(tenkan_p).max() + prices.rolling(tenkan_p).min()) / 2
-        # Kijun-sen: same over kijun_p
-        kijun = (prices.rolling(kijun_p).max() + prices.rolling(kijun_p).min()) / 2
-        # Senkou Span A: (tenkan + kijun) / 2, shifted forward kijun_p periods
-        span_a = ((tenkan + kijun) / 2).shift(kijun_p)
-        # Senkou Span B: (highest + lowest) / 2 over senkou_p, shifted forward kijun_p
-        span_b = ((prices.rolling(senkou_p).max() + prices.rolling(senkou_p).min()) / 2).shift(kijun_p)
-
-        # Cloud top and bottom
+        tp = signals_config["ichimoku"]["tenkan"]
+        kp = signals_config["ichimoku"]["kijun"]
+        sp = signals_config["ichimoku"]["senkou"]
+        tenkan = (prices.rolling(tp).max() + prices.rolling(tp).min()) / 2
+        kijun = (prices.rolling(kp).max() + prices.rolling(kp).min()) / 2
+        span_a = ((tenkan + kijun) / 2).shift(kp)
+        span_b = ((prices.rolling(sp).max() + prices.rolling(sp).min()) / 2).shift(kp)
         cloud_top = pd.concat([span_a, span_b], axis=1).max(axis=1)
         cloud_bot = pd.concat([span_a, span_b], axis=1).min(axis=1)
-
-        # Signal: +1 above cloud, -1 below cloud, 0 inside cloud
         ichi_signal = pd.Series(0.0, index=prices.index)
         ichi_signal[prices > cloud_top] = 1.0
         ichi_signal[prices < cloud_bot] = -1.0
-
         month_ends["Ichimoku"] = ichi_signal.loc[month_ends.index].values
         signal_columns["Ichimoku"] = signals_config["ichimoku"]["weight"]
 
-    # ── TRIANGULAR MA ──
     if signals_config["tma"]["enabled"]:
         period = signals_config["tma"]["period"]
-        # TMA = SMA of SMA — double smoothing
         first_sma = prices.rolling(period, min_periods=period // 2).mean()
         tma = first_sma.rolling(period, min_periods=period // 2).mean()
-
-        # Signal: +1 if price > TMA, -1 if price < TMA
         tma_signal = np.sign(prices - tma)
         month_ends["TMA"] = tma_signal.loc[month_ends.index].values
         signal_columns["TMA"] = signals_config["tma"]["weight"]
 
-    # ── COMPOSITE ──
     if not signal_columns:
         month_ends["Composite"] = 0.0
     else:
-        # Normalize weights of enabled signals to sum to 1
         total_w = sum(signal_columns.values())
         if total_w == 0:
             total_w = 1.0
-
         composite = pd.Series(0.0, index=month_ends.index)
         for sig_name, raw_weight in signal_columns.items():
             norm_w = raw_weight / total_w
             month_ends[f"{sig_name}_Contribution"] = norm_w * month_ends[sig_name]
             composite += month_ends[f"{sig_name}_Contribution"]
-
         month_ends["Composite"] = composite.clip(-1, 1)
 
     month_ends = month_ends.drop(columns=["YM"], errors="ignore").reset_index()
@@ -159,7 +136,6 @@ def compute_signals(df_daily, signals_config):
 
 
 def run_backtest(df_daily, df_signals, vol_config):
-    """Run daily backtest with optional vol targeting."""
     df = df_daily.copy()
     df = df.set_index("Date") if "Date" in df.columns else df.copy()
     df["Market_Ret"] = df["CO1"].pct_change()
@@ -176,7 +152,6 @@ def run_backtest(df_daily, df_signals, vol_config):
         df.loc[mask, "Signal"] = sig_val
     df["Raw_Position"] = df["Signal"].ffill().fillna(0)
 
-    # Vol targeting
     if vol_config["enabled"]:
         vt = vol_config["target"]
         vl = vol_config["lookback"]
@@ -190,8 +165,6 @@ def run_backtest(df_daily, df_signals, vol_config):
         df["Position"] = df["Raw_Position"]
 
     df["Strat_Gross"] = df["Position"] * df["Market_Ret"]
-
-    # Transaction costs (hardcoded 5bps)
     tc = 0.0005
     df["Month"] = df.index.to_period("M")
     monthly_pos = df.groupby("Month")["Raw_Position"].first()
@@ -207,36 +180,30 @@ def run_backtest(df_daily, df_signals, vol_config):
     df["Cumulative"] = (1 + df["Strat_Net"].fillna(0)).cumprod()
     df["BH_Ret"] = df["Market_Ret"].fillna(0)
     df["BH_Cumulative"] = (1 + df["BH_Ret"]).cumprod()
-    df["Drawdown"] = df["Cumulative"] / df["Cumulative"].cummax() - 1
     df = df.drop(columns=["Month"], errors="ignore").reset_index()
     return df
 
 
 def compute_stats(df_bt, return_col="Strat_Net", cum_col="Cumulative"):
-    """Bloomberg-style stats: arithmetic annualization."""
     rets = df_bt[return_col].dropna()
     n_days = len(rets)
     if n_days == 0:
         return {k: 0 for k in ["ann_ret","ann_vol","sharpe","max_dd","hit_rate"]}
-
     ann_ret = rets.mean() * 252
     ann_vol = rets.std() * np.sqrt(252)
     sharpe = ann_ret / ann_vol if ann_vol > 0 else 0
     max_dd = (df_bt[cum_col] / df_bt[cum_col].cummax() - 1).min()
-    total_ret = df_bt[cum_col].iloc[-1] - 1
-
     df_temp = df_bt.copy()
     df_temp["YM"] = pd.to_datetime(df_temp["Date"]).dt.to_period("M")
     monthly_rets = df_temp.groupby("YM")[return_col].apply(lambda x: (1+x).prod()-1)
     hit_rate = (monthly_rets > 0).sum() / len(monthly_rets) if len(monthly_rets) > 0 else 0
-
     return {"ann_ret": ann_ret, "ann_vol": ann_vol, "sharpe": sharpe,
-            "max_dd": max_dd, "hit_rate": hit_rate, "total_ret": total_ret, "n_days": n_days}
+            "max_dd": max_dd, "hit_rate": hit_rate, "n_days": n_days}
 
 
 def main():
-    st.markdown("# Brent Crude Oil CTA — Backtest Platform")
-    st.markdown("**Systematic Long/Short Strategy on Brent Crude Futures**")
+    st.markdown("# Wes Vidhya and Vinay Backtest Platform")
+    st.markdown("**Brent Crude Oil CTA — Systematic Long/Short Strategy**")
 
     df_raw = load_data()
     if df_raw is None:
@@ -249,7 +216,6 @@ def main():
     min_date = df_raw["Date"].min().date()
     max_date = df_raw["Date"].max().date()
 
-    # ── SIDEBAR ──
     with st.sidebar:
         st.header("Backtest Settings")
         col1, col2 = st.columns(2)
@@ -260,7 +226,6 @@ def main():
         df_filt = df_raw[(df_raw["Date"] >= pd.Timestamp(start_date)) & (df_raw["Date"] <= pd.Timestamp(end_date))]
         st.caption(f"{start_date} to {end_date} — {len(df_filt):,} days, {df_filt['Date'].dt.to_period('M').nunique()} months")
 
-        # ── Signal 1: TSMOM ──
         st.divider()
         tsmom_on = st.toggle("Signal 1 — TSMOM", value=True, key="tsmom_on")
         if tsmom_on:
@@ -275,19 +240,16 @@ def main():
                 st.error("Select at least one lookback.")
                 st.stop()
         else:
-            tsmom_w = 0
-            lookbacks = [21, 63, 252]
+            tsmom_w = 0; lookbacks = [21, 63, 252]
 
-        # ── Signal 2: Carry ──
         st.divider()
         carry_on = st.toggle("Signal 2 — Carry", value=True, key="carry_on")
         if carry_on:
-            st.caption("Trades the curve shape. Long in backwardation, short in contango.")
+            st.caption("Trades the curve. Long in backwardation, short in contango.")
             carry_w = st.slider("Weight", 0.0, 1.0, 0.45, 0.05, key="cw")
         else:
             carry_w = 0
 
-        # ── Signal 3: Vol Targeting ──
         st.divider()
         vol_on = st.toggle("Signal 3 — Vol Targeting", value=True, key="vol_on")
         if vol_on:
@@ -296,10 +258,8 @@ def main():
             vol_target = vol_target_pct / 100
             vol_lookback = st.select_slider("Vol Lookback (days)", options=[10, 15, 21, 42, 63], value=21)
         else:
-            vol_target = 0.15
-            vol_lookback = 21
+            vol_target = 0.15; vol_lookback = 21; vol_target_pct = 15
 
-        # ── Signal 4: Ichimoku ──
         st.divider()
         ichi_on = st.toggle("Signal 4 — Ichimoku Cloud", value=False, key="ichi_on")
         if ichi_on:
@@ -309,42 +269,35 @@ def main():
             ichi_kijun = st.number_input("Kijun Period", 10, 60, 26, key="ik")
             ichi_senkou = st.number_input("Senkou Period", 20, 120, 52, key="is")
         else:
-            ichi_w = 0
-            ichi_tenkan, ichi_kijun, ichi_senkou = 9, 26, 52
+            ichi_w = 0; ichi_tenkan = 9; ichi_kijun = 26; ichi_senkou = 52
 
-        # ── Signal 5: Triangular MA ──
         st.divider()
         tma_on = st.toggle("Signal 5 — Triangular MA", value=False, key="tma_on")
         if tma_on:
-            st.caption("Double-smoothed moving average. Long above, short below.")
+            st.caption("Double-smoothed MA. Long above, short below.")
             tma_w = st.slider("Weight", 0.0, 1.0, 0.25, 0.05, key="tmaw")
             tma_period = st.slider("Period (days)", 10, 200, 50, 5, key="tmap")
         else:
-            tma_w = 0
-            tma_period = 50
+            tma_w = 0; tma_period = 50
 
-        # Weight summary
-        enabled_signals = []
-        if tsmom_on: enabled_signals.append(("TSMOM", tsmom_w))
-        if carry_on: enabled_signals.append(("Carry", carry_w))
-        if ichi_on: enabled_signals.append(("Ichimoku", ichi_w))
-        if tma_on: enabled_signals.append(("TMA", tma_w))
-
-        if not enabled_signals:
+        enabled = []
+        if tsmom_on: enabled.append(("TSMOM", tsmom_w))
+        if carry_on: enabled.append(("Carry", carry_w))
+        if ichi_on: enabled.append(("Ichimoku", ichi_w))
+        if tma_on: enabled.append(("TMA", tma_w))
+        if not enabled:
             st.divider()
             st.error("Enable at least one directional signal.")
             st.stop()
 
         st.divider()
-        total_w = sum(w for _, w in enabled_signals)
+        total_w = sum(w for _, w in enabled)
         st.caption("**Active Signals:**")
-        for name, w in enabled_signals:
+        for name, w in enabled:
             norm_w = w / total_w if total_w > 0 else 0
             st.caption(f"  {name}: {w:.2f} → normalized {norm_w:.0%}")
-        vol_label = f"  Vol Target: {vol_target_pct}%" if vol_on else "  Vol Target: off"
-        st.caption(vol_label)
+        st.caption(f"  Vol Target: {vol_target_pct}%" if vol_on else "  Vol Target: off")
 
-    # ── BUILD CONFIG ──
     signals_config = {
         "tsmom": {"enabled": tsmom_on, "weight": tsmom_w, "lookbacks": lookbacks},
         "carry": {"enabled": carry_on, "weight": carry_w},
@@ -354,12 +307,9 @@ def main():
     }
     vol_config = {"enabled": vol_on, "target": vol_target, "lookback": vol_lookback}
 
-    # ── COMPUTE ──
     max_lb = max(lookbacks) if tsmom_on else 252
-    if ichi_on:
-        max_lb = max(max_lb, ichi_senkou + ichi_kijun + 10)
-    if tma_on:
-        max_lb = max(max_lb, tma_period * 2 + 10)
+    if ichi_on: max_lb = max(max_lb, ichi_senkou + ichi_kijun + 10)
+    if tma_on: max_lb = max(max_lb, tma_period * 2 + 10)
     lb_start = pd.Timestamp(start_date) - pd.Timedelta(days=int(max_lb * 1.6))
     df_lb = df_raw[df_raw["Date"] >= lb_start].copy()
     if len(df_lb) < max_lb:
@@ -382,7 +332,6 @@ def main():
     ss = compute_stats(df_bt, "Strat_Net", "Cumulative")
     bh = compute_stats(df_bt, "BH_Ret", "BH_Cumulative")
 
-    # ── STRATEGY OVERVIEW ──
     with st.expander("Strategy Overview — How Each Signal Works", expanded=False):
         st.markdown("""
         ### Signal 1 — TSMOM (Time-Series Momentum)
@@ -476,7 +425,6 @@ def main():
         move lasts for months.
         """)
 
-    # ── PERFORMANCE ──
     st.markdown("---")
     st.subheader("Performance Summary")
     st.caption("**Strategy**")
@@ -496,7 +444,6 @@ def main():
     c4.metric("Max Drawdown", f"{bh['max_dd']:.1%}")
     c5.metric("Hit Rate", f"{bh['hit_rate']:.1%}")
 
-    # ── CUMULATIVE ──
     st.markdown("---")
     st.subheader("Cumulative Returns")
     fig = go.Figure()
@@ -511,7 +458,6 @@ def main():
                       xaxis=dict(rangeslider=dict(visible=True)))
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── VOL TARGETING ──
     if vol_on:
         st.markdown("---")
         st.subheader("Vol Targeting")
@@ -531,7 +477,6 @@ def main():
         fig_vol.update_yaxes(title_text="Scalar", secondary_y=True)
         st.plotly_chart(fig_vol, use_container_width=True)
 
-    # ── SIGNALS ──
     st.markdown("---")
     st.subheader("Signal Analysis")
     df_sig_disp = df_signals_bt[(df_signals_bt["Date"] >= pd.Timestamp(start_date)) &
@@ -560,49 +505,6 @@ def main():
                             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                             yaxis_title="Contribution")
         st.plotly_chart(fig_c, use_container_width=True)
-
-    # ── DETAIL TABLE ──
-    st.markdown("---")
-    st.subheader("Monthly Detail")
-
-    # Build display columns dynamically
-    base_cols = ["Date", "CO1", "CO12"]
-    if "Carry_Spread" in df_sig_disp.columns: base_cols.append("Carry_Spread")
-    for sig in active_names:
-        if sig in df_sig_disp.columns: base_cols.append(sig)
-    base_cols.append("Composite")
-    dmd = df_sig_disp[[c for c in base_cols if c in df_sig_disp.columns]].copy()
-
-    bt_t = df_bt.copy()
-    bt_t["YM"] = pd.to_datetime(bt_t["Date"]).dt.to_period("M")
-    m_sr = bt_t.groupby("YM")["Strat_Net"].apply(lambda x: (1+x).prod()-1)
-    m_mr = bt_t.groupby("YM")["Market_Ret"].apply(lambda x: (1+x).prod()-1)
-    m_sc = (1+m_sr).cumprod()
-    m_bc = (1+m_mr).cumprod()
-    m_vs = bt_t.groupby("YM")["Vol_Scalar"].mean()
-
-    dmd["YM"] = pd.to_datetime(dmd["Date"]).dt.to_period("M")
-    if vol_on:
-        dmd = dmd.merge(m_vs.rename("Vol Scalar"), left_on="YM", right_index=True, how="left")
-    dmd = dmd.merge(m_sr.rename("Strat Ret"), left_on="YM", right_index=True, how="left")
-    dmd = dmd.merge(m_mr.rename("Mkt Ret"), left_on="YM", right_index=True, how="left")
-    dmd = dmd.merge(m_sc.rename("Cum Strat"), left_on="YM", right_index=True, how="left")
-    dmd = dmd.merge(m_bc.rename("Cum B&H"), left_on="YM", right_index=True, how="left")
-    dmd = dmd.drop(columns=["YM"])
-    dmd["Date"] = dmd["Date"].dt.strftime("%Y-%m-%d")
-    if "Carry_Spread" in dmd.columns:
-        dmd = dmd.rename(columns={"Carry_Spread": "Carry Spread"})
-
-    # Build format dict dynamically
-    fmt = {"CO1":"${:.2f}", "CO12":"${:.2f}", "Composite":"{:+.3f}",
-           "Strat Ret":"{:.2%}", "Mkt Ret":"{:.2%}", "Cum Strat":"{:.4f}", "Cum B&H":"{:.4f}"}
-    if "Carry Spread" in dmd.columns: fmt["Carry Spread"] = "{:.2%}"
-    if "Vol Scalar" in dmd.columns: fmt["Vol Scalar"] = "{:.2f}"
-    for sig in active_names:
-        if sig in dmd.columns: fmt[sig] = "{:+.3f}"
-
-    st.dataframe(dmd.style.format(fmt), use_container_width=True, height=400)
-    st.download_button("Download Monthly Detail", dmd.to_csv(index=False), "monthly_detail.csv", "text/csv")
 
     st.markdown("---")
     st.caption("Brent CTA Backtest Platform. Built with Streamlit.")
